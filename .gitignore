@@ -1,1 +1,4 @@
 task.md
+.env*
+*.txt
+*.db
