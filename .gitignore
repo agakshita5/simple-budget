@@ -2,3 +2,7 @@ task.md
 .env*
 *.txt
 *.db
+utcToist.py
+credentials.json
+myvenv/
+*.DS_Store
