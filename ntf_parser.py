@@ -4,6 +4,7 @@ import plistlib
 import re
 import tempfile
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 EXPENSE_BUNDLES = {
     "com.blinkit.consumer",
@@ -29,6 +30,7 @@ AMOUNT_RE = re.compile(
 # Absolute path to expenses DB (same folder as this script)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPENSES_DB = os.path.join(SCRIPT_DIR, "expenses.db")
+IST = ZoneInfo("Asia/Kolkata")
 
 # HELPERS 
 def get_notification_db_path() -> str:
@@ -177,7 +179,10 @@ def read_and_store_notifications(limit: int = 100, db_path: str = EXPENSES_DB):
             continue
 
         delivered_ts = row["delivered_date"]
-        delivered_at = mac_epoch + timedelta(seconds=delivered_ts)
+        # utc time
+        delivered_at_utc = mac_epoch + timedelta(seconds=delivered_ts) 
+        # convert utc to ist 
+        delivered_at_ist = delivered_at_utc.astimezone(IST)
 
         data_blob = row["data"]
         try:
@@ -202,8 +207,8 @@ def read_and_store_notifications(limit: int = 100, db_path: str = EXPENSES_DB):
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             row["rec_id"],
-            delivered_at.strftime("%Y-%m-%d"),
-            delivered_at.strftime("%H:%M"),
+            delivered_at_ist.strftime("%Y-%m-%d"),
+            delivered_at_ist.strftime("%H:%M"),
             merchant,
             amount,
             category,
