@@ -6,3 +6,4 @@ utcToist.py
 credentials.json
 myvenv/
 *.DS_Store
+*.log
