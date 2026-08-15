@@ -2,44 +2,88 @@ import os
 import sqlite3
 import plistlib
 import re
+import glob
+import shutil
 import tempfile
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import gspread
+import logging
+
+# absolute path for the log file
+log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracker.log")
+
+# configure the logging system once
+logging.basicConfig(
+    filename=log_path,
+    level=logging.INFO, 
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
 EXPENSE_BUNDLES = {
-    "com.kirana2k19",
-    "com.amazon.Amazon",
-    "net.whatsapp.whatsapp",
-    "com.apple.ScreenContinuity",
-    "com.apple.MobileSMS",
-    "com.apple.mobilesms",
+    # delivery/food
+    "com.grofers.consumer",     # blinkit
+    "com.zeptonow.customer",    # zepto
+    "bundl.instamart",          # instamart
+    "bundl.swiggy",             # swiggy
+    "com.zomato.zomato",        # zomato
+    "com.dominosin.olo",        # dominos
+    # transport/shopping
+    "com.ubercab.UberClient",   # uber
+    "com.amazon.AmazonIN",      # amazon india
+    "com.myntra.Myntra",        # myntra
+    # payments/bank
+    "com.hdfcbank.ios.now",     # hdfc bank app
+    "com.phonepe.PhonePeApp",   # phonepe
+    "com.google.paisa",         # google pay india
+    # messaging (bank sms + order pings)
+    # macOS Continuity variants
+    "com.apple.MobileSMS",      # ios messages (mirrored)
+    "com.apple.mobilesms",      # macos continuity sms forwarding
     "com.apple.ichat",
-    "com.grofers.Grofers",       # Blinkit
-    "com.zepto.consumer",       # Zepto
-    "com.kiranakart.zepto",     # Zepto (Alt)
-    "com.bundl.swiggy",         # Swiggy
-    "com.zomato.zomato",        # Zomato
-    "com.ubercab.UberClient",   # Uber
+    "net.whatsapp.WhatsApp",    # ios whatsapp (mirrored)
+    "net.whatsapp.whatsapp",    # macos whatsapp
 }
 
 AMOUNT_RE = re.compile(
-    r"₹\s*(\d+(?:\.\d{2})?)"
-    r"|INR\s*(\d+(?:\.\d{2})?)"
-    r"|Total[:\s]+[\$₹]?\s*(\d+(?:\.\d{2})?)"
-    r"|Grand Total[:\s]+[\$₹]?\s*(\d+(?:\.\d{2})?)"
-    r"|Amount[:\s]+[\$₹]?\s*(\d+(?:\.\d{2})?)"
-    r"|paid[:\s]+[\$₹]?\s*(\d+(?:\.\d{2})?)"
-    r"|debited[:\s]+[\$₹]?\s*(\d+(?:\.\d{2})?)"
-    , re.IGNORECASE
+    r"(?:₹|INR|Rs\.?)\s*([\d,]+(?:\.\d{1,2})?)"
+    r"|(?:grand total|total|amount|paid|debited|charged|spent)\s*[:\-]?\s*"
+    r"(?:₹|INR|Rs\.?|\$)?\s*([\d,]+(?:\.\d{1,2})?)",
+    re.IGNORECASE,
 )
 
-# Absolute path to expenses DB (same folder as this script)
+PROMO_RE = re.compile(
+    r"\b(?:off|sale|discount|coupon|deal|deals|offer|offers|save|savings|cashback|"
+    r"free|flat|upto|up to|starting at|starts at|lowest|cheapest|craving|cravings|"
+    r"waiting|grab|hurry|last chance|limited time|explore|shop now|order now)\b",
+    re.IGNORECASE,
+)
+
+ORDER_RE = re.compile(
+    r"\b(?:order(?:ed)?|placed|confirmed|delivered|delivery|out for delivery|"
+    r"arriving|on the way|dispatched|shipped|paid|payment|receipt|bill|invoice|"
+    r"debited|charged|trip|ride|fare|completed)\b",
+    re.IGNORECASE,
+)
+
+# absolute path to expenses DB (same folder as this script)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPENSES_DB = os.path.join(SCRIPT_DIR, "expenses.db")
 IST = ZoneInfo("Asia/Kolkata")
 CREDENTIALS_FILE = os.path.join(SCRIPT_DIR, "credentials.json")
 SHEET_NAME = "My Expenses"
+
+# iPhone Mirroring writes mirrored notifications here as NSKeyedArchiver plists.
+# this is a different store from usernoted's sqlite db, which only holds mac-local
+# notifications (no third-party iOS app ever appears there)
+REMOTE_NOTIF_DIR = os.path.expanduser(
+    "~/Library/Group Containers/group.com.apple.UserNotifications"
+    "/Library/UserNotifications/Remote"
+)
+
+# apple's core data epoch: 2001-01-01 UTC
+MAC_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
 
 # HELPERS 
 def get_notification_db_path() -> str:
@@ -61,15 +105,64 @@ def get_notification_db_path() -> str:
         "Run a test notification or restart usernoted to create it."
     )
 
+def copy_nc_db(dst_path: str) -> bool:
+    """copy the live Notification Center DB using plain file reads"""
+
+    src = get_notification_db_path()
+    try:
+        shutil.copy2(src, dst_path)
+        if os.path.exists(src + "-wal"):
+            shutil.copy2(src + "-wal", dst_path + "-wal")
+        return True
+    except OSError as e:
+        logging.error(f"Could not copy Notification Center DB: {e}")
+        return False
+
+def unarchive_plist(path: str):
+    """read an NSKeyedArchiver plist into plain dicts/lists"""
+    
+    with open(path, "rb") as fh:
+        raw = plistlib.load(fh)
+    objects = raw.get("$objects", [])
+
+    def resolve(node, depth=0):
+        if depth > 16:
+            return None
+        if isinstance(node, plistlib.UID):
+            return resolve(objects[node.data], depth + 1)
+        if isinstance(node, dict):
+            if "NS.keys" in node:
+                return {resolve(k, depth + 1): resolve(v, depth + 1)
+                        for k, v in zip(node["NS.keys"], node["NS.objects"])}
+            if "NS.objects" in node:
+                return [resolve(v, depth + 1) for v in node["NS.objects"]]
+            return {k: resolve(v, depth + 1) for k, v in node.items() if k != "$class"}
+        return node
+
+    return resolve(raw["$top"]["root"]) if objects else None
+
 def extract_amount(text: str) -> float | None:
     m = AMOUNT_RE.search(text or "")
     if not m:
         return None
     val = next((g for g in m.groups() if g is not None), None)
-    return float(val) if val else None
+    if not val:
+        return None
+    try:
+        return float(val.replace(",", ""))
+    except ValueError:
+        return None
+
+def looks_like_expense(text: str) -> bool:
+    """true only for notifications describing a transaction, not an ad"""
+    if not text:
+        return False
+    if PROMO_RE.search(text) and not ORDER_RE.search(text):
+        return False
+    return bool(ORDER_RE.search(text))
 
 def init_expenses_db(db_path: str = EXPENSES_DB):
-    print("Initializing expenses DB at:", db_path)
+    logging.info(f"Initializing expenses DB at: {db_path}")
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("""
@@ -85,6 +178,7 @@ def init_expenses_db(db_path: str = EXPENSES_DB):
             source_app TEXT
         )
     """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pending_orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,6 +193,32 @@ def init_expenses_db(db_path: str = EXPENSES_DB):
             status TEXT DEFAULT 'PENDING'
         )
     """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS processed_notifications (
+            key TEXT PRIMARY KEY,
+            seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            bundle_id TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+def already_processed(key: str) -> bool:
+    conn = sqlite3.connect(EXPENSES_DB)
+    hit = conn.execute(
+            "SELECT 1 FROM processed_notifications WHERE key = ?", (key,)
+        ).fetchone()
+    conn.close()
+    return hit is not None
+
+def mark_processed(key: str, bundle_id: str):
+    conn = sqlite3.connect(EXPENSES_DB)
+    conn.execute(
+        "INSERT OR IGNORE INTO processed_notifications (key, bundle_id) VALUES (?, ?)",
+        (key, bundle_id),
+    )
     conn.commit()
     conn.close()
 
@@ -122,11 +242,13 @@ def infer_merchant_category(bundle_id: str, title: str, body: str):
 
     if "grofers" in bundle_id or "blinkit" in text:
         return "Blinkit", "Groceries"
-    if "kirana2k19" in bundle_id or "zepto" in text:
+    if "zeptonow" in bundle_id or "zepto" in text:
         return "Zepto", "Groceries"
-    if "swiggy" in bundle_id or "instamart" in text:
+    if "swiggy" in bundle_id:
+        return "Swiggy", "Food"
+    if "instamart" in text:
         return "Instamart", "Groceries"
-    if "uber" in bundle_id or "uber" in text:
+    if "ubercab" in bundle_id or "uber" in text:
         return "Uber", "Transport"
     if "amazon" in bundle_id or "amazon" in text:
         return "Amazon", "Shopping"
@@ -149,7 +271,7 @@ def infer_merchant_category(bundle_id: str, title: str, body: str):
 
 def sync_expense_to_sheet(rec_id, date_str, time_str, merchant, amount, category, payment_mode, source_app):
     if not os.path.exists(CREDENTIALS_FILE):
-        print("Warning: credentials.json not found. Skipping Google Sheets sync.")
+        logging.warning("Warning: credentials.json not found -> skipping google sheets sync")
         return
 
     try:
@@ -161,15 +283,15 @@ def sync_expense_to_sheet(rec_id, date_str, time_str, merchant, amount, category
         row = [rec_id, date_str, time_str, merchant, amount, category, payment_mode, source_app]
 
         worksheet.append_row(row, value_input_option="USER_ENTERED")
-        print(f"Successfully synced ₹{amount} ({merchant}) to Google Sheets.")
+        logging.info(f"Successfully synced ₹{amount} ({merchant}) to Google Sheets")
 
     except Exception as e:
-        print(f"Failed to sync row to Google Sheets: {e}")
+        logging.error(f"Failed to sync row to Google Sheets: {e}", exc_info=True)
 
 def handle_app_notification(rec_id, date_str, time_str, merchant, amount, category, source_app):
     """called when an app notification arrives"""
 
-    conn = sqlite3.connect("expenses.db")
+    conn = sqlite3.connect(EXPENSES_DB)
     cur = conn.cursor()
 
     cur.execute("""
@@ -191,11 +313,11 @@ def handle_bank_sms(rec_id, date_str, time_str, amount, sms_merchant, source_app
     if not found - update expenses as transfer & sync to gsheet
     """
 
-    conn = sqlite3.connect("expenses.db")
+    conn = sqlite3.connect(EXPENSES_DB)
     cur = conn.cursor()
 
-    # Look for a pending app order with matching amount created in the last 10 minutes
-    ten_mins_ago = (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+    # look for a pending app order with matching amount created in the last 10 minutes
+    ten_mins_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
 
     cur.execute("""
         SELECT id, rec_id, date_str, time_str, merchant, category, source_app 
@@ -214,12 +336,12 @@ def handle_bank_sms(rec_id, date_str, time_str, amount, sms_merchant, source_app
         cur.execute("""
             INSERT OR IGNORE INTO expenses 
             (rec_id, date, time, merchant, amount, category, payment_mode, source_app)
-            VALUES (?, ?, ?, ?, ?, ?, "upi, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'upi', ?)
         """, (app_rec_id, app_date, app_time, app_merchant, amount, category, app_source))
 
         if cur.rowcount > 0:
             sync_expense_to_sheet(app_rec_id, app_date, app_time, app_merchant, amount, category, "upi", app_source)
-            print(f"Matched Bank SMS with App Order! [{app_merchant} - ₹{amount} via upi]")
+            logging.info(f"Matched Bank SMS with App Order! [{app_merchant} - ₹{amount} via upi]")
     else:
         category = "Transfer / Personal"
         
@@ -231,7 +353,7 @@ def handle_bank_sms(rec_id, date_str, time_str, amount, sms_merchant, source_app
 
         if cur.rowcount > 0:
             sync_expense_to_sheet(rec_id, date_str, time_str, sms_merchant, amount, category, "upi", source_app)
-            print(f"Recorded Standalone Bank SMS Expense: [{sms_merchant} - ₹{amount} via upi]")
+            logging.info(f"Recorded Standalone Bank SMS Expense: [{sms_merchant} - ₹{amount} via upi]")
 
     conn.commit()
     conn.close()
@@ -239,10 +361,10 @@ def handle_bank_sms(rec_id, date_str, time_str, amount, sms_merchant, source_app
 def handle_expired_pending_orders():
     """checks for orders older than 10 minutes without matching bank sms and marks them as cash payments"""
 
-    conn = sqlite3.connect("expenses.db")
+    conn = sqlite3.connect(EXPENSES_DB)
     cur = conn.cursor()
 
-    ten_mins_ago = (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+    ten_mins_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
 
     # fetch all orders older than 10 mins still marked as PENDING
     cur.execute("""
@@ -263,49 +385,34 @@ def handle_expired_pending_orders():
         """, (rec_id, date_str, time_str, merchant, amount, category, source_app))
         
         if cur.rowcount > 0:
-            sync_expense_to_sheet(date_str, time_str, merchant, amount, category, "Cash", source_app)
-            print(f"No Bank SMS within 10 mins. Recorded as CASH: [{merchant} - ₹{amount}]")
+            sync_expense_to_sheet(rec_id, date_str, time_str, merchant, amount, category, "Cash", source_app)
+            logging.info(f"No Bank SMS within 10 mins. Recorded as CASH: [{merchant} - ₹{amount}]")
 
     conn.commit()
     conn.close()
 
-def read_and_store_notifications(limit: int = 100, db_path: str = EXPENSES_DB):
-    nc_db_src = get_notification_db_path()
-    print("Using Notification Center DB (source):", nc_db_src)
-
-    # Verify source DB exists
-    if not os.path.exists(nc_db_src):
-        raise RuntimeError(f"Notification Center DB not found at: {nc_db_src}")
-
-    # Create the temporary file object using SQLITE BACKUP API, which captures db, db-wal, and db-shm altogether
+def read_and_store_notifications(limit: int = 100):
+    """read mac-local notifications (bank SMS via Continuity) from usernoted's sqlite db"""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp_file:
         tmp_db_path = tmp_file.name
 
-    try:
-        src_conn = sqlite3.connect(f"file:{nc_db_src}?mode=ro", uri=True) # source connction (READ-ONLY)
-        dst_conn = sqlite3.connect(tmp_db_path) # destination connection
-        src_conn.backup(dst_conn)
-        src_conn.close()
-        dst_conn.close()
-        print("Safely backed up live DB (including WAL) to temp file.")
-    except Exception as e:
-        raise RuntimeError(f"Failed to copy Notification Center DB safely: {e}")
+    if not copy_nc_db(tmp_db_path):
+        return
 
     conn_nc = sqlite3.connect(tmp_db_path)
     conn_nc.row_factory = sqlite3.Row
     cur_nc = conn_nc.cursor()
 
-    # Debug: list tables in temp DB
     cur_nc.execute("SELECT name FROM sqlite_master WHERE type='table'")
     tables = [r[0] for r in cur_nc.fetchall()]
     
     if "record" not in tables:
-        print("WARNING: 'record' table not found in NC DB. The DB was likely just reset.")
+        logging.warning("WARNING: 'record' table not found in NC DB. The DB was likely just reset.")
         conn_nc.close()
         os.remove(tmp_db_path)
         return
 
-    # Join record with app to get bundle identifier
+    # join record with app to get bundle identifier
     cur_nc.execute("""
         SELECT
             r.rec_id,
@@ -318,23 +425,19 @@ def read_and_store_notifications(limit: int = 100, db_path: str = EXPENSES_DB):
         LIMIT ?
     """, (limit,))
 
-    mac_epoch = datetime(2001, 1, 1, tzinfo=timezone.utc) # Apple Core Data epoch is Jan 1, 2001 UTC
-
     app_notifications_processed = 0
     bank_sms_processed = 0
 
     for row in cur_nc.fetchall():
         bundle_id = row["bundle_id"]
-        print("Bundle Id of current ntf", bundle_id)
         if bundle_id not in EXPENSE_BUNDLES:
-            print("bundle id skipped", bundle_id)
             continue
 
-        delivered_ts = row["delivered_date"]
-        # utc time
-        delivered_at_utc = mac_epoch + timedelta(seconds=delivered_ts) 
-        # convert utc to ist 
-        delivered_at_ist = delivered_at_utc.astimezone(IST)
+        key = f"nc:{row['rec_id']}"
+        if already_processed(key):
+            continue
+
+        delivered_at_ist = (MAC_EPOCH + timedelta(seconds=row["delivered_date"])).astimezone(IST)
 
         data_blob = row["data"]
         try:
@@ -343,21 +446,22 @@ def read_and_store_notifications(limit: int = 100, db_path: str = EXPENSES_DB):
             plist = {}
 
         req = plist.get("req", {}) or plist
-        title = req.get("title", "") or plist.get("title", "")
-        body = req.get("body", "") or plist.get("body", "")
-        text = f"{title} {body}".strip()
+        title = req.get("titl") or req.get("title") or ""
+        subtitle = req.get("subt") or req.get("subtitle") or ""
+        body = req.get("body") or ""
+        text = f"{title} {subtitle} {body}".strip()
 
         date_str = delivered_at_ist.strftime("%Y-%m-%d")
         time_str = delivered_at_ist.strftime("%H:%M")
-        rec_id = row["rec_id"]
+        mark_processed(key, bundle_id)
 
         # 1. bank sms notification (mobilesms / ichat)
-        if "mobilesms" in bundle_id or "ichat" in bundle_id or "hdfc" in text.lower():
+        if "mobilesms" in bundle_id.lower() or "ichat" in bundle_id.lower() or "hdfc" in text.lower():
             parsed_sms = parse_hdfc_sms(text)
             if parsed_sms:
                 # Pass extracted SMS amount to the matcher logic
                 handle_bank_sms(
-                    rec_id = rec_id,
+                    rec_id = key,
                     date_str = date_str,
                     time_str = time_str,
                     amount = parsed_sms["amount"],
@@ -369,14 +473,14 @@ def read_and_store_notifications(limit: int = 100, db_path: str = EXPENSES_DB):
 
         # 2. app notifications (blinkit, zepto, uber, etc.)
         amount = extract_amount(text)
-        if amount is None:
+        if amount is None or not looks_like_expense(text):
             continue
 
-        merchant, category = infer_merchant_category(bundle_id, title, body)
+        merchant, category = infer_merchant_category(bundle_id, title, f"{subtitle} {body}")
 
         # route app notification through the pending order handler
         handle_app_notification(
-            rec_id = rec_id,
+            rec_id = key,
             date_str = date_str,
             time_str = time_str,
             merchant = merchant,
@@ -387,23 +491,101 @@ def read_and_store_notifications(limit: int = 100, db_path: str = EXPENSES_DB):
         app_notifications_processed += 1
         
     conn_nc.close()
-    os.remove(tmp_db_path)
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(tmp_db_path + suffix):
+            os.remove(tmp_db_path + suffix)
 
-    print(f"Processed notifications:")
-    print(f"  - App orders added to pending: {app_notifications_processed}")
-    print(f"  - Bank SMS processed: {bank_sms_processed}")
+    logging.info(f"  - Mac-local app orders: {app_notifications_processed}")
+    logging.info(f"  - Bank SMS processed: {bank_sms_processed}")
+
+def read_remote_notifications():
+    """read notifications mirrored from the iPhone"""
+
+    pattern = os.path.join(REMOTE_NOTIF_DIR, "*", "*", "DeliveredNotifications.plist")
+    files = glob.glob(pattern)
+    if not files:
+        logging.warning("No mirrored notifications found. Check if iPhone Mirroring is connected.")
+        return 0
+
+    processed = 0
+    for path in files:
+        try:
+            entries = unarchive_plist(path)
+        except Exception as e:
+            logging.error(f"Could not decode {os.path.basename(os.path.dirname(path))}: {e}")
+            continue
+
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            details = (entry.get("EventBehavior") or {}).get("eventDetails") or {}
+
+            bundle_id = details.get("bundleIdentifier")
+            if bundle_id not in EXPENSE_BUNDLES:
+                continue
+
+            identifier = entry.get("AppNotificationIdentifier") or details.get("identifier")
+            key = f"remote:{bundle_id}:{identifier}"
+            if not identifier or already_processed(key):
+                continue
+
+            title = entry.get("AppNotificationTitle") or details.get("title") or ""
+            body = entry.get("AppNotificationMessage") or details.get("body") or ""
+            subtitle = details.get("subtitle") or ""
+            if subtitle == title:     
+                subtitle = ""
+            text = f"{title} {subtitle} {body}".strip()
+
+            created = entry.get("AppNotificationCreationDate")
+            if isinstance(created, dict):
+                created = created.get("NS.time")
+            if not isinstance(created, (int, float)):
+                continue
+            delivered_at = (MAC_EPOCH + timedelta(seconds=created)).astimezone(IST)
+
+            mark_processed(key, bundle_id)
+
+            amount = extract_amount(text)
+            if amount is None or not looks_like_expense(text):
+                logging.info(f"skipped (no amount / not a transaction): {bundle_id} | {text[:70]}")
+                continue
+
+            merchant, category = infer_merchant_category(bundle_id, title, f"{subtitle} {body}")
+            handle_app_notification(
+                rec_id = key,
+                date_str = delivered_at.strftime("%Y-%m-%d"),
+                time_str = delivered_at.strftime("%H:%M"),
+                merchant = merchant,
+                amount = amount,
+                category = category,
+                source_app = bundle_id,
+            )
+            processed += 1
+            logging.info(f"Mirrored expense queued: {merchant} - ₹{amount} [{bundle_id}]")
+
+    return processed
 
 def process_notifications():
-    print("Starting Expense Processing Pipeline...")
+    logging.info("Starting Expense Processing Pipeline...")
     init_expenses_db()
 
-    # read new app & bank notifications from macOS Notification Center
+    logging.info("Processed notifications:")
+
+    # app orders mirrored from the iPhone
+    mirrored = read_remote_notifications()
+    logging.info(f"  - Mirrored app orders: {mirrored}")
+
+    # bank SMS forwarded to the Mac via Continuity
     read_and_store_notifications(limit=100)
 
     # resolve any pending orders older than 10 minutes as CASH
     handle_expired_pending_orders()
 
-    print("Pipeline Execution Complete")
+    logging.info("Pipeline Execution Complete")
 
 if __name__ == "__main__":
-    process_notifications()
+    try:
+        process_notifications()
+    except Exception:
+        logging.exception("Pipeline failed")
+        raise

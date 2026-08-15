@@ -7,3 +7,5 @@ credentials.json
 myvenv/
 *.DS_Store
 *.log
+*.plist
+__pycache__
