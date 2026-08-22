@@ -1,0 +1,26 @@
+name: AI Code Review
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install groq pydantic python-dotenv
+
+      - name: Run review
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: python review.py
