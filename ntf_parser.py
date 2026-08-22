@@ -465,7 +465,7 @@ def handle_expired_pending_orders():
                 logging.info(f"Cash order, amount unknown -> row added for manual fill: [{merchant} {date_str} {time_str}]")
             continue
 
-        cur.execute("UPDATE pending_orders SET status = 'COMPLETED' WHERE id = ?", (pending_id,))
+        cur.execute("UPDATE pending_orders SET status = 'CASH_RECORDED' WHERE id = ?", (pending_id,))
         cur.execute("""
             INSERT OR IGNORE INTO expenses 
             (rec_id, date, time, merchant, amount, category, payment_mode, source_app)
