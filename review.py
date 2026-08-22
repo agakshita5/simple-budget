@@ -10,9 +10,7 @@ import json
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
-# ---------------------------------------------------------------------------
-# 1. Pydantic Schema for Structured Output
-# ---------------------------------------------------------------------------
+# ====Pydantic Schema for Structured Output====
 class FailurePoint(BaseModel):
     location: str = Field(description="File and line number/function where failure may occur")
     failure_reason: str = Field(description="How and why the code will break or throw an unhandled exception")
@@ -23,34 +21,7 @@ class ChaosReview(BaseModel):
         max_length=2
     )
 
-# ---------------------------------------------------------------------------
-# 2. Extract Git Diff from Runner Environment
-# ---------------------------------------------------------------------------
-def get_git_diff() -> str:
-    """Extracts the diff for the pushed commit(s) on the current branch."""
-    try:
-        # In GitHub Actions 'push' context, HEAD~1...HEAD gets the diff of the latest commit.
-        # If HEAD~1 is unavailable (e.g. initial commit), fall back to git diff HEAD.
-        result = subprocess.run(
-            ["git", "diff", "HEAD~1", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        logging.info("git diff HEAD~1 worked")
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        print(f"[Warning] Failed to fetch HEAD~1 diff: {e.stderr}")
-        logging.warning(f"[Warning] Failed to fetch HEAD~1 diff: {e.stderr}")
-        # Fallback for shallow clones or fresh repos
-        fallback = subprocess.run(
-            ["git", "diff", "HEAD"],
-            capture_output=True,
-            text=True
-        )
-        logging.info("git diff HEAD worked")
-        return fallback.stdout.strip()
-
+# ====Extract Git Diff from Runner Environment====
 def get_git_diff() -> str:
     before, after = os.getenv("BEFORE_SHA"), os.getenv("AFTER_SHA")
     empty = "0000000000000000000000000000000000000000"
@@ -67,10 +38,7 @@ def get_git_diff() -> str:
 
 # zero-SHA branch — that's what github.event.before contains on the first push to a new branch.
 
-
-# ---------------------------------------------------------------------------
-# 3. LLM Review Execution
-# ---------------------------------------------------------------------------
+# ====LLM Review Execution====
 
 def run_review(diff_text: str):
     api_key = os.getenv("GROQ_API_KEY")
